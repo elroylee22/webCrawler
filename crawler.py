@@ -6,6 +6,7 @@ import psycopg2
 from dotenv import load_dotenv
 from openai import OpenAI
 from playwright.async_api import async_playwright, Page
+from bs4 import BeautifulSoup
 import signal
 
 # === Load Environment ===
@@ -13,7 +14,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PRISMA_URL = os.getenv("PRISMA_URL")
 START_ID = 0
-MAX_CONCURRENT = 10
+MAX_CONCURRENT = 7  # or 10 if your computer can handle it
 
 # === Set OpenAI key ===
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
@@ -79,8 +80,9 @@ def save_to_db(company_id, gpt_data):
 # === AI Extraction Functions ===
 async def translate_to_english_if_needed(raw_text):
     prompt = f"""
-You are a translation engine. If the text is NOT English, translate it fully to English.
-If it is already English, return it exactly as is.
+You are a translation engine. Detect the language of the text below.
+If it is NOT English, translate it fully into English.
+If it is already English, return exactly the original text unchanged.
 
 Text:
 {raw_text[:1500]}
@@ -98,18 +100,17 @@ Text:
         return raw_text
 
 def extract_with_gpt(english_text):
-    trimmed_text = english_text[:6000]  # Still trimmed for cost optimization
+    trimmed_text = english_text[:7000]
     prompt = f"""
 You are analyzing a company's website content.
 
-Please extract the following:
-1. "product_name": List ALL products/services mentioned. Be very detailed. E.g., "Jeans, Shirts, Jackets", not just "Clothes".
-2. "product_function": For each product/service, describe clearly what it is used for. Be as detailed as possible.
-3. "product_location": Where the company operates or provides services (e.g., specific cities, regions, countries).
-4. "product_qual": Any certifications, awards, industry standards, or notable achievements mentioned.
+Please extract the following, and be as detailed as possible:
+1. "product_name": List ALL products or services. Be specific, not just general (e.g., list 'Jeans, Jackets' instead of 'Clothing').
+2. "product_function": Describe clearly what each product or service does.
+3. "product_location": Where the company operates or offers services.
+4. "product_qual": Certifications, awards, standards mentioned.
 
-Return STRICTLY valid JSON in this format:
-
+Return STRICT JSON format:
 {{
   "product_name": "...",
   "product_function": "...",
@@ -117,12 +118,11 @@ Return STRICTLY valid JSON in this format:
   "product_qual": "..."
 }}
 
-⚠️ Do not explain anything. Do not add notes. Only output JSON. No surrounding text.
-
+No explanation, no notes — only JSON.
 Here is the website text:
-\"\"\"
+---
 {trimmed_text}
-\"\"\"
+---
 """.strip()
 
     try:
@@ -156,8 +156,9 @@ async def process_company(company, playwright):
     try:
         page: Page = await context.new_page()
         try:
-            await page.goto(website, timeout=25000)
-            await page.wait_for_timeout(1500)
+            await page.goto(website, timeout=20000)
+            await page.wait_for_load_state('networkidle', timeout=20000)
+            await page.wait_for_timeout(2000)  # Additional wait for dynamic loading
         except Exception as e:
             print(f"❌ Cannot open {website} → {e}")
             cur.execute("""
@@ -174,9 +175,11 @@ async def process_company(company, playwright):
             return
 
         try:
-            content = await page.inner_text("body", timeout=8000)
+            html_content = await page.content()
+            soup = BeautifulSoup(html_content, "html.parser")
+            text_content = soup.get_text(separator="\n", strip=True)
         except Exception as e:
-            print(f"⚠️ Content unreadable for {name}. Marking as unreadable.")
+            print(f"⚠️ Content unreadable for {name}: {e}")
             cur.execute("""
                 UPDATE companies
                 SET product_name = %s, product_function = '', product_location = '', product_qual = '', updated_at = NOW()
@@ -186,7 +189,7 @@ async def process_company(company, playwright):
             print(f"☠️ Marked as unreadable (Company ID {company_id})")
             return
 
-        translated_content = await translate_to_english_if_needed(content)
+        translated_content = await translate_to_english_if_needed(text_content)
         gpt_result = extract_with_gpt(translated_content)
 
         if gpt_result:
